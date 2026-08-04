@@ -78,7 +78,7 @@ One is active, the other idle.
 ```
                 ┌───────────────┐    ┌───────────────┐
   internet ────▶│   ACTIVE      │    │     IDLE      │
-   (port)       │ app:latest   │    │  (new release)│
+   (port)       │ app:latest    │    │  (new release)│
                 └───────────────┘    └───────────────┘
                        blue              green
                    (serving users)   (waiting for health check)
