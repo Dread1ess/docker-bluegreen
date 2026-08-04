@@ -1,4 +1,4 @@
-# docker-bluegreen
+# Docker BlueGreen
 
 Universal Blue-Green deployment script for Docker with automatic rollback and zero-downtime releases.
 
