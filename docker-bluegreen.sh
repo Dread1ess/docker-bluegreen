@@ -12,13 +12,51 @@
 #  picks up ./deploy.env if it is located next to the script.
 #
 #  Usage:
-#    ./docker-bluegreen.sh deploy          # deploy a new version
+#    ./docker-bluegreen.sh deploy [-t TAG]  # deploy a new version
 #    ./docker-bluegreen.sh rollback        # roll back to the previous release
 #    ./docker-bluegreen.sh status          # show current state
 #    ./docker-bluegreen.sh logs [name]     # show container logs (blue|green)
 #    ./docker-bluegreen.sh down            # stop both containers
 # =============================================================================
 set -euo pipefail
+
+# =============================================================================
+#  Output helpers
+# =============================================================================
+
+log()  { printf '\033[1;36m[bluegreen]\033[0m %s\n' "$*"; }
+info() { printf '\033[1;33m[info]\033[0m      %s\n' "$*"; }
+ok()   { printf '\033[1;32m[ok]\033[0m        %s\n' "$*"; }
+err()  { printf '\033[1;31m[error]\033[0m    %s\n' "$*" >&2; }
+
+# =============================================================================
+#  Load deploy.env (existing environment variables take priority over it)
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/deploy.env}"
+
+load_env() { # $1 = path to the env file
+  local _line _key
+  while IFS= read -r _line; do
+    _line="${_line//$'\r'/}"              # strip CR (Windows line endings)
+    [[ -z "$_line" ]] && continue
+    [[ "$_line" == \#* ]] && continue
+    if [[ "$_line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      _key="${BASH_REMATCH[1]}"
+      if [[ -n "${!_key+x}" ]]; then      # already set by the environment?
+        continue                          #   -> environment wins over deploy.env
+      fi
+    fi
+    # shellcheck disable=SC2163
+    eval "$_line" 2>/dev/null || true
+  done < "$1"
+}
+
+if [[ -f "$ENV_FILE" ]]; then
+  load_env "$ENV_FILE"
+  info "Loaded settings from $ENV_FILE"
+fi
 
 # =============================================================================
 #  CONFIGURATION
@@ -42,14 +80,17 @@ HOST_PORTS="${HOST_PORTS:-8080:80}"
 USE_REVERSE_PROXY="${USE_REVERSE_PROXY:-false}"
 
 # Extra arguments for docker run (volumes, env, network, etc.)
-# Example: DOCKER_RUN_ARGS="-v /data:/data -e FOO=bar --network mynet --restart unless-stopped"
-DOCKER_RUN_ARGS="${DOCKER_RUN_ARGS:--restart unless-stopped}"
+# Example: DOCKER_RUN_ARGS="-v /data:/data -e FOO=bar --restart unless-stopped"
+# Note: the nested quotes are required so the leading "--" of the default
+# is preserved (otherwise bash would turn "--restart" into "-restart").
+DOCKER_RUN_ARGS="${DOCKER_RUN_ARGS:-"--restart unless-stopped"}"
 
-# Network (docker network), if needed. Empty - default network.
+# Docker network, if needed. Empty - default network.
+# (Do not duplicate this in DOCKER_RUN_ARGS.)
 DOCKER_NETWORK="${DOCKER_NETWORK:-}"
 
 # URL/command health check for the new container.
-#   Option 1 - HTTP: HEALTHCHECK_URL="http://localhost:8080/health"
+#   Option 1 - HTTP:  HEALTHCHECK_URL="http://localhost:8080/health"
 #   Option 2 - command: HEALTHCHECK_CMD="wget -q -O - http://localhost/health"
 # If both are empty - only checks that the container is started and alive.
 HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
@@ -66,10 +107,6 @@ HEALTH_RETRIES="${HEALTH_RETRIES:-15}"
 # Example: "systemctl reload nginx"  or  "docker exec nginx nginx -s reload"
 SWITCH_COMMAND="${SWITCH_COMMAND:-}"
 
-# docker-compose settings (if you use compose files to describe the container)
-COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
-COMPOSE_SERVICE="${COMPOSE_SERVICE:-}"
-
 # =============================================================================
 #  NO NEED TO CHANGE BELOW
 # =============================================================================
@@ -83,7 +120,8 @@ CONTAINER_GREEN="${APP_NAME}-green"
 # IMPORTANT: do not duplicate these volumes in DOCKER_RUN_ARGS.
 STATE_VOLUMES=()
 
-# Helper file storing the name of the last deployed tag (for rollback)
+# Helper file storing the image of the version replaced by the last deploy
+# (i.e. the image `rollback` will restore).
 STATE_FILE="/tmp/${APP_NAME}.bluegreen.state"
 
 DOCKER="${DOCKER:-docker}"
@@ -91,20 +129,6 @@ DOCKER="${DOCKER:-docker}"
 # =============================================================================
 #  Helper functions
 # =============================================================================
-
-log()  { printf '\033[1;36m[bluegreen]\033[0m %s\n' "$*"; }
-info() { printf '\033[1;33m[info]\033[0m      %s\n' "$*"; }
-ok()   { printf '\033[1;32m[ok]\033[0m        %s\n' "$*"; }
-err()  { printf '\033[1;31m[error]\033[0m    %s\n' "$*" >&2; }
-
-# Load deploy.env if it exists next to the script
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/deploy.env}"
-if [[ -f "$ENV_FILE" ]]; then
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  info "Loaded settings from $ENV_FILE"
-fi
 
 # Build the ports string for docker run
 build_ports_args() {
@@ -134,10 +158,13 @@ require_docker() {
   fi
 }
 
-# Check whether the container name is free or used by our image
+# Container status: running | exited | ... | absent
+# Note: uses process substitution instead of a pipe because `grep -q` exits
+# early, the producer gets SIGPIPE, and under `set -o pipefail` that would
+# wrongly turn a successful match into a failed pipeline.
 container_state() { # $1 = container name
   local name="$1"
-  if "$DOCKER" ps -a --format '{{.Names}}' | grep -qx "$name"; then
+  if grep -Fqx "$name" < <("$DOCKER" ps -a --format '{{.Names}}'); then
     "$DOCKER" inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo "unknown"
   else
     echo "absent"
@@ -146,17 +173,18 @@ container_state() { # $1 = container name
 
 run_container() { # $1 = container name, $2 = image
   local name="$1" img="$2"
-  local args
+  local args net_args=()
   args="$(build_ports_args) $(build_volume_args) $DOCKER_RUN_ARGS"
+  [[ -n "$DOCKER_NETWORK" ]] && net_args=(--network "$DOCKER_NETWORK")
   # shellcheck disable=SC2086
   "$DOCKER" run -d --name "$name" \
     -l "bluegreen.app=$APP_NAME" \
     -l "bluegreen.color=${name##*-}" \
+    -l "bluegreen.active=true" \
+    "${net_args[@]}" \
     $args \
     "$img" >/dev/null
 }
-
-get_health_retries() { echo "$HEALTH_RETRIES"; }
 
 wait_container_ready() { # $1 = container name
   local name="$1" timeout="$START_TIMEOUT" waited=0
@@ -167,7 +195,7 @@ wait_container_ready() { # $1 = container name
     if [[ "$st" == "running" ]]; then
       return 0
     fi
-    if [[ "$st" == "exited" || "$st" == "dead" || "$st" == "restarting" ]]; then
+    if [[ "$st" == "exited" || "$st" == "dead" || "$st" == "restarting" || "$st" == "paused" ]]; then
       err "Container $name stopped working (status: $st). Check the logs:"
       "$DOCKER" logs --tail 30 "$name" >&2 || true
       return 1
@@ -183,10 +211,22 @@ healthcheck() { # $1 = container name
   local name="$1" i
   local port_url="${HEALTHCHECK_URL}"
 
-  # If URL is not set but ports are given - try to guess the first host port
-  if [[ -z "$port_url" && -z "$HEALTHCHECK_CMD" && -n "$HOST_PORTS" ]]; then
-    local host_port="${HOST_PORTS%%:*}"
-    port_url="http://localhost:${host_port%% *}/"
+  # HTTP checks need curl
+  if [[ -z "$HEALTHCHECK_CMD" && -n "$port_url" ]] && ! command -v curl >/dev/null 2>&1; then
+    err "curl is required for HTTP health checks but was not found."
+    err "Install curl or set HEALTHCHECK_CMD instead."
+    return 1
+  fi
+
+  # If neither URL nor command is set but ports are published, try to guess
+  # the first host port. Skipped in reverse-proxy mode (no ports published).
+  if [[ -z "$port_url" && -z "$HEALTHCHECK_CMD" && -n "$HOST_PORTS" && "$USE_REVERSE_PROXY" != "true" ]]; then
+    local first_pair host_port
+    first_pair="${HOST_PORTS%% *}" # first "host:container" pair
+    host_port="${first_pair%:*}"   # strip ":containerPort"
+    host_port="${host_port##*:}"   # keep the hostPort (also works for "ip:port:container")
+    [[ -z "$host_port" ]] && host_port="localhost"
+    port_url="http://localhost:${host_port}/"
     info "HEALTHCHECK_URL not set, checking first port: $port_url"
   fi
 
@@ -195,7 +235,7 @@ healthcheck() { # $1 = container name
     return 0
   fi
 
-  for (( i=1; i<=$(get_health_retries); i++ )); do
+  for (( i=1; i<=HEALTH_RETRIES; i++ )); do
     local code=0
     if [[ -n "$HEALTHCHECK_CMD" ]]; then
       # shellcheck disable=SC2086
@@ -209,29 +249,23 @@ healthcheck() { # $1 = container name
     fi
     sleep 2
   done
-  err "Health check failed after $(($(get_health_retries) * 2)) seconds"
+  err "Health check failed after $((HEALTH_RETRIES * 2)) seconds"
   return 1
 }
 
-# Start the new container: create it if absent, otherwise recreate it
-start_new() { # $1 = container name
-  local name="$1"
+# Create the container if absent, otherwise recreate it
+start_new() { # $1 = container name, $2 = image (defaults to $IMAGE)
+  local name="$1" img="${2:-$IMAGE}"
   local st
   st="$(container_state "$name")"
   if [[ "$st" == "absent" ]]; then
-    log "Creating new container $name from image $IMAGE"
-    run_container "$name" "$IMAGE"
+    log "Creating new container $name from image $img"
+    run_container "$name" "$img"
   else
-    log "Container $name exists (status: $st). Removing and recreating from $IMAGE"
+    log "Container $name exists (status: $st). Removing and recreating from $img"
     "$DOCKER" rm -f "$name" >/dev/null 2>&1 || true
-    run_container "$name" "$IMAGE"
+    run_container "$name" "$img"
   fi
-}
-
-switch_remove_old() { # $1 = old (inactive) container
-  local name="$1"
-  log "Stopping and removing old container $name"
-  "$DOCKER" rm -f "$name" >/dev/null 2>&1 || true
 }
 
 # =============================================================================
@@ -251,8 +285,16 @@ cmd_deploy() {
   if [[ "$(container_state "$active")" == "absent" && "$(container_state "$inactive")" == "absent" ]]; then
     log "First deployment - starting $active"
     start_new "$active"
-    wait_container_ready "$active" || { rollback; exit 1; }
-    healthcheck "$active" || { rollback; exit 1; }
+    if ! wait_container_ready "$active"; then
+      err "Container $active did not start. Removing it."
+      "$DOCKER" rm -f "$active" >/dev/null 2>&1 || true
+      exit 1
+    fi
+    if ! healthcheck "$active"; then
+      err "Health check failed for $active. Removing it."
+      "$DOCKER" rm -f "$active" >/dev/null 2>&1 || true
+      exit 1
+    fi
     ok "Deployment finished. Active: $active"
     exit 0
   fi
@@ -272,6 +314,12 @@ cmd_deploy() {
     exit 1
   fi
 
+  # Save the image of the current active container for later rollback,
+  # BEFORE it is stopped/removed below.
+  if [[ "$(container_state "$active")" != "absent" ]]; then
+    "$DOCKER" inspect -f '{{.Config.Image}}' "$active" > "$STATE_FILE" 2>/dev/null || true
+  fi
+
   # ---- Switch ----
   if [[ "$USE_REVERSE_PROXY" == "true" ]]; then
     if [[ -n "$SWITCH_COMMAND" ]]; then
@@ -280,16 +328,13 @@ cmd_deploy() {
       eval "$SWITCH_COMMAND"
     else
       info "USE_REVERSE_PROXY=true, but SWITCH_COMMAND is not set."
-      info "Hint: configure your reverse proxy to select the container with label 'active=true', or set SWITCH_COMMAND."
+      info "Hint: point your reverse proxy at the container with label 'bluegreen.active=true'."
     fi
     "$DOCKER" rm -f "$active" >/dev/null 2>&1 || true
   else
     log "Stopping old active container $active"
-    "$DOCKER" stop "$active" >/dev/null
+    "$DOCKER" stop "$active" >/dev/null 2>&1 || true
   fi
-
-  # Save the previous image for rollback
-  "$DOCKER" inspect -f '{{.Config.Image}}' "$inactive" > "$STATE_FILE" 2>/dev/null || true
 
   ok "Deployment finished. Active: $inactive"
 }
@@ -303,16 +348,15 @@ cmd_rollback() {
     active="$CONTAINER_GREEN"; inactive="$CONTAINER_BLUE"
   fi
 
-  if [[ -f "$STATE_FILE" ]]; then
-    prev_image="$(cat "$STATE_FILE")"
-    log "Rolling back to image: $prev_image"
-  else
-    info "State file missing, rollback is not possible (no previous version)"
+  if [[ ! -f "$STATE_FILE" ]]; then
+    info "State file missing ($STATE_FILE) - rollback is not possible"
     exit 1
   fi
+  prev_image="$(cat "$STATE_FILE")"
+  log "Rolling back to image: $prev_image"
 
   # Start the previous version in the inactive container
-  start_new "$inactive"
+  start_new "$inactive" "$prev_image"
   if ! wait_container_ready "$inactive"; then
     err "Rollback failed: container $inactive did not start"
     "$DOCKER" rm -f "$inactive" >/dev/null 2>&1 || true
@@ -320,8 +364,14 @@ cmd_rollback() {
   fi
 
   log "Switching traffic back to $inactive"
-  if [[ "$USE_REVERSE_PROXY" == "true" ]]; then
-    [[ -n "$SWITCH_COMMAND" ]] && eval "$SWITCH_COMMAND"
+  if [[ "$USE_REVERSE_PROXY" == "true" && -n "$SWITCH_COMMAND" ]]; then
+    # shellcheck disable=SC2086
+    eval "$SWITCH_COMMAND"
+  fi
+  # Remember the image we are moving away from, so a second `rollback`
+  # undoes this one (toggle between the two versions).
+  if [[ "$(container_state "$active")" != "absent" ]]; then
+    "$DOCKER" inspect -f '{{.Config.Image}}' "$active" > "$STATE_FILE" 2>/dev/null || true
   fi
   "$DOCKER" stop "$active" >/dev/null 2>&1 || true
   "$DOCKER" rm -f "$active" >/dev/null 2>&1 || true
@@ -381,7 +431,7 @@ Usage:
   $0 logs [blue|green]       Show container logs
   $0 down                    Stop and remove both containers
 
-Settings are read from:
+Settings priority:
   1. Environment variables
   2. deploy.env file next to the script
   3. Defaults at the top of the script
@@ -409,8 +459,18 @@ case "$CMD" in
   deploy)
     while [[ $# -gt 0 ]]; do
       case "$1" in
-        -t) IMAGE="${2:-$IMAGE}"; shift 2 ;;
-        *) shift ;;
+        -t)
+          if [[ $# -lt 2 ]]; then
+            err "Option -t requires a value (e.g. -t myapp:v2)"
+            exit 1
+          fi
+          IMAGE="$2"
+          shift 2
+          ;;
+        *)
+          err "Unknown option: $1"
+          exit 1
+          ;;
       esac
     done
     cmd_deploy
